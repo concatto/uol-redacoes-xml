@@ -3,6 +3,7 @@
 import scrapy
 import html2text
 import re
+import traceback
 from pyquery import PyQuery as pq
 
 h = html2text.HTML2Text()
@@ -68,16 +69,35 @@ def handle_essay_content(html):
     d = pq(html)
     if d.text() == '':
         return '', []
+    print(d.text())
+
+    reds = d.find('span[style*="#FF0000"]')
+    for red in reds:
+        red = pq(red)
+        print("Element: ", red)
+        print("Text: ", red.text())
+        for sub in red.nextAll():
+            sub = pq(sub)
+            print("(next)    ", sub)
+
+        for sub in red.prevAll():
+            sub = pq(sub)
+            print("(prev)    ", sub)
+    
     errors = []
+
     # This catches only few errors in the most recent version of the page layout
     #errors = d.find('s').map(lambda i, e: (pq(e).text())) 
     # Some of the evaluators corrections are inside a span, and the span contains the text with the fixed version
     for strike in d.find('p > span > s, p > span > strike'):
         new_text = pq(strike).text()
+        print("Strike --> ", strike)
+        print("New text ==> ", new_text)
         if new_text is None: continue
         # Sometimes the fixed text has spaces and the original version (selected part) has not,
         # causing words to get mixed
         review_text = pq(pq(strike).html()).remove('s, strik').text()
+        print("Review text ~~> ", review_text)
         if not new_text.startswith(' ') and review_text.startswith(' '):
             new_text = ' ' + new_text
         if not new_text.endswith(' ') and review_text.endswith(' '):
@@ -114,7 +134,10 @@ def handle_essay_comments(html):
 class BrasilEscolaSpider(scrapy.Spider):
     name =  'brasilescolaspider'
     allowed_domains = ['vestibular.brasilescola.uol.com.br']
-    start_urls = ['http://vestibular.brasilescola.uol.com.br/banco-de-redacoes/']
+    start_urls = [
+        'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-corrupcao.htm',
+       # 'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-caminhos-para-superar-os-desafios-encontrados-pelos-negros-atualmente.htm'
+    ]
 
     def parse(self, response):
         prompt_url = response.url
@@ -128,50 +151,59 @@ class BrasilEscolaSpider(scrapy.Spider):
             'url': prompt_url,
             'date': date
         }
-	
+    
         for essay_url in response.css('table#redacoes_corrigidas a::attr(href)').extract():
+            if '8117' not in essay_url and '13591' not in essay_url:
+                continue
+            
             print('Reading essay from URL {0}'.format(essay_url))
-            if essay_url == '': continue
             yield response.follow(essay_url, self.parse_essay, meta={'prompt': prompt_url})
             # break
 
-        next_page = response.css('div.paginador a::attr(href)').extract()[0]
-        if next_page != '': # and 'caminhos' in next_page:
-            yield response.follow(next_page, self.parse)
+        #next_page = response.css('div.paginador a::attr(href)').extract()[0]
+        #if next_page != '': # and 'caminhos' in next_page:
+        #    yield response.follow(next_page, self.parse)
 
     def parse_essay(self, response):
-        title = strip(get_text(response, '.conteudo-pagina h1').replace('Banco de Redações', ''))
-        scores = {}
+        try:
+            title = strip(get_text(response, '.conteudo-pagina h1').replace('Banco de Redações', ''))
+            scores = {}
 
-        score_items = response.css('.conteudo-pagina table tr td:nth-child(2)::text').extract()[1:6]
-        if extract_number(score_items[0]) == -1: 
-            score_items = response.css('.conteudo-pagina table tr td:nth-child(3)::text').extract()[0:5]
+            score_items = response.css('.conteudo-pagina table tr td:nth-child(2)::text').extract()[1:6]
+            if extract_number(score_items[0]) == -1: 
+                score_items = response.css('.conteudo-pagina table tr td:nth-child(3)::text').extract()[0:5]
 
-        for i, score_text in enumerate(score_items):
-            scores['Competência {0}'.format(i+1)] = extract_number(score_text)
+            for i, score_text in enumerate(score_items):
+                scores['Competência {0}'.format(i+1)] = extract_number(score_text)
 
-        score_text = response.css('.conteudo-pagina table tr td[colspan="2"] span::text').extract_first()
-        total_score = extract_number(score_text)
-        if total_score == -1: total_score = response.css('.conteudo-pagina table tr td:nth-child(2)::text').extract()[6]
+            score_text = response.css('.conteudo-pagina table tr td[colspan="2"] span::text').extract_first()
+            total_score = extract_number(score_text)
+            if total_score == -1: total_score = response.css('.conteudo-pagina table tr td:nth-child(2)::text').extract()[6]
 
-        html_text = ''.join(response.css('.conteudo-pagina .conteudo-materia > p').extract())
-        review = remove_double_breaks(get_div_text(html_text))
-        original_text, errors = handle_essay_content(html_text)
+            html_text = ''.join(response.css('.conteudo-pagina .conteudo-materia > p').extract())
+            review = remove_double_breaks(get_div_text(html_text))
+            original_text, errors = handle_essay_content(html_text)
 
-        html_comments = ''.join(response.css('.conteudo-pagina .conteudo-materia > div').extract())
-        comments = handle_essay_comments(html_comments)
-        yield {
-            'type': 'essay',
-            'prompt': response.meta['prompt'],
-            'date': get_text(response, '#redacao_dt_tema_left').replace('Redação enviada em ', ''),
-            'title': title,
-            'text': original_text,
-            'final_score': total_score,
-            'criteria_scores': scores,
-            'url': response.url,
-            'review': review,
-            'errors': errors,
-            'comments': comments
-        }
+            print("THIS WOULD GO INTO THE JSON FILE AS \"text\"")
+            print(original_text)
+            print("END OF TEXT")
+
+            html_comments = ''.join(response.css('.conteudo-pagina .conteudo-materia > div').extract())
+            comments = handle_essay_comments(html_comments)
+            yield {
+                'type': 'essay',
+                'prompt': response.meta['prompt'],
+                'date': get_text(response, '#redacao_dt_tema_left').replace('Redação enviada em ', ''),
+                'title': title,
+                'text': original_text,
+                'final_score': total_score,
+                'criteria_scores': scores,
+                'url': response.url,
+                'review': review,
+                'errors': errors,
+                'comments': comments
+            }
+        except Exception as e:
+            traceback.print_exc()
 
 
