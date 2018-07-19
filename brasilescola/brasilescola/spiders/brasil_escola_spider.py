@@ -4,7 +4,9 @@ import scrapy
 import html2text
 import re
 import traceback
+from unidecode import unidecode
 from pyquery import PyQuery as pq
+from bs4 import BeautifulSoup
 
 h = html2text.HTML2Text()
 h.ignore_links = True
@@ -20,10 +22,22 @@ ESSAY_COMMENTS_SUB = re.compile(r'.+Comentários do corretor', re.DOTALL)
 ESSAY_COMMENTS_SUB2 = re.compile(r'Competências avaliadas.+', re.DOTALL)
 ESSAY_TEXT_SUB = re.compile(r' \[[^\]]+\] ')
 ESSAY_TEXT_SUB2 = re.compile(r'\[[^\]]+\]')
+ESSAY_TEXT_SUB3 = re.compile(r' \[[^\]]*\]')
+RED_SPAN = 'span[style*="#FF0000"], span[style*="rgb(255"]'
+STRUCK_TEXT = 'strike, s'
+CORRECTED_FULL_STOP = ' (.)'
+CORRECTED_COMMA = ' (,)'
+CORRECTED_SEMICOLON = ' (;)'
 
+# Handles both tags and navigable strings.
+def as_text(element):
+    return element.string
 
 def strip(text):
     return IGNORE_CHAR.sub('', text)
+
+def children_with_content(element):
+    return [child for child in element.children if len(as_text(child).strip()) > 0]
 
 def get_text(response, select):
     text = response.css(select+'::text').extract_first()
@@ -64,25 +78,158 @@ def handle_prompt_content(html):
 
     return description, info, date
 
+def is_part_of_word(element):
+    print("Testing if part of word ", element)
+    text = element.get_text()
+    prev_el = element.previous_sibling
+    next_el = element.next_sibling
+    print("Prev \"%s\"" % prev_el)
+    print("Next \"%s\"" % next_el)
+    if ((prev_el and prev_el[-1].isalpha() and text[0].isalpha()) or
+        (next_el and next_el[0].isalpha() and text[-1].isalpha())):
+        print("Yes")
+        return True
+    
+    print("No")
+    return False
+
+def remove_wrapped_in_parenthesis(dom):
+    for el in dom.select(RED_SPAN):
+        print("Testing", el, type(el))
+
+        prev_el = el.previous_sibling
+        next_el = el.next_sibling
+        print("Prev \"%s\"" % prev_el, type(prev_el))
+        print("Next \"%s\"" % next_el, type(next_el))
+
+        if prev_el != None and next_el != None:
+            if prev_el.endswith("(") and next_el.startswith(")"):
+                prev_el.replace_with(prev_el[0:-1])
+                next_el.replace_with(next_el[1:])
+                el.decompose()
+                print("Should remove this one")
+
+def correct_spacing(new_text, element):
+    prev_el = element.previous_sibling
+    next_el = element.next_sibling
+
+    print("Going to correct!")
+    print("Prev \"%s\"" % prev_el)
+    print("Next \"%s\"" % next_el)
+
+    if prev_el and as_text(prev_el)[-1].isalpha() and new_text[0].isalpha():
+        new_text = " " + new_text
+
+    if next_el and as_text(next_el)[0].isalpha() and new_text[-1].isalpha():
+        new_text += " "
+
+    print("Result after correcting: \"%s\"" % new_text)
+    return new_text
+
+def handle_struck_text(el):
+    c = children_with_content(el)
+    print("There are ", len(c), " children: ", c)
+
+    if len(c) == 1:
+        if is_part_of_word(el):
+            return el.get_text() # leave it as it is
+        else:
+            return correct_spacing(el.get_text(), el)
+    else:
+        for child in el.children:
+            if child.name == None:
+                child.extract() # remove every text node
+
+        for struck in el.select(STRUCK_TEXT):
+            print("Struck: ", struck)
+            
+            struck.string = correct_spacing(struck.get_text(), struck)
+            print("Corrected to: \"%s\"" % struck.string)
+        
+        return correct_spacing(el.get_text(), el)
+
+
+def remove_within_square_brackets(dom):
+    for section in dom.select("strong"):
+        print("Original: \"%s\"" % section)
+
+        new_text = ESSAY_TEXT_SUB3.sub('', section.get_text())
+        new_text = ESSAY_TEXT_SUB2.sub('', new_text)
+        print("New: \"%s\"" % new_text)
+
+        section.replace_with(new_text)
+
+
+def handle_recent_content(dom):
+    for el in dom.select('span[style*="#e74c3c"]'):
+        print("!!! Looking @ ", el)
+        struck_parents = list(el.find_parents("s"))
+        print("!!! Struck parents:")
+        print(struck_parents)
+
+
+def handle_content_alternative(html):
+    dom = BeautifulSoup(html.replace("*", ""))
+    print(dom)
+    print("== # ==")
+    print(dom.prettify())
+
+    handle_recent_content(dom)
+    print("========== $$$ ==========")
+    remove_within_square_brackets(dom)
+    print("========== &&& ==========")
+    
+    had_red = False
+    for el in dom.select(RED_SPAN):
+        print("Looking @ element: ", el)
+        text = el.get_text()
+        new_text = text
+        print("Original text: \"%s\"" % text)
+        has_letter = True in (c.isalpha() for c in text)
+
+        if has_letter and is_part_of_word(el) and el.select_one(STRUCK_TEXT) == None:
+            decoded = unidecode(text)
+
+            if decoded != text:
+                new_text = decoded # if it had an accent, remove the accent
+            elif len(text) == 1 and text.isupper():
+                new_text = text.lower() # if it got corrected to uppercase, undo it
+            else:
+                new_text = "" # otherwise remove the text itself
+        else:
+            if el.select_one(STRUCK_TEXT) != None:
+                new_text = handle_struck_text(el)
+
+        new_text = new_text.replace(CORRECTED_FULL_STOP, '')
+        new_text = new_text.replace(CORRECTED_COMMA, '')
+        new_text = new_text.replace(CORRECTED_SEMICOLON, '')
+        el.replace_with(new_text)
+
+        had_red = True
+
+
+    if had_red:
+        remove_wrapped_in_parenthesis(dom)
+
+    print(dom.prettify())
+    print("== * ==")
+    
+    
+    paragraphs = list(map(lambda x: x.get_text(), dom.select("p")))
+    for i, paragraph in enumerate(paragraphs):
+        print("%d. %s" % (i + 1, paragraph))
+
+
+    print("============================================================")
+
 def handle_essay_content(html):
+    handle_content_alternative(html)
+
     # TODO Fix error 'ID redacoes_corrigidas already defined' in lxml.etree.XMLSyntaxError: line 111
     d = pq(html)
     if d.text() == '':
         return '', []
     print(d.text())
-
-    reds = d.find('span[style*="#FF0000"]')
-    for red in reds:
-        red = pq(red)
-        print("Element: ", red)
-        print("Text: ", red.text())
-        for sub in red.nextAll():
-            sub = pq(sub)
-            print("(next)    ", sub)
-
-        for sub in red.prevAll():
-            sub = pq(sub)
-            print("(prev)    ", sub)
     
     errors = []
 
@@ -135,8 +282,17 @@ class BrasilEscolaSpider(scrapy.Spider):
     name =  'brasilescolaspider'
     allowed_domains = ['vestibular.brasilescola.uol.com.br']
     start_urls = [
-        'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-corrupcao.htm',
-       # 'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-caminhos-para-superar-os-desafios-encontrados-pelos-negros-atualmente.htm'
+        #'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-corrupcao.htm',
+        #'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-caminhos-para-superar-os-desafios-encontrados-pelos-negros-atualmente.htm',
+        #"https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-Agua-desafio-uso-racional-preservacao.htm",
+        #"https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-estamos-nos-relacionando-forma-superficial.htm",
+        #"https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-porte-armas-pela-populacao-civil.htm",
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-desinformacao-historica-um-problema-mil-consequencias.htm",
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-os-caminhos-viaveis-para-uma-saude-publica-qualidade.htm",
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-favelizacao.htm",
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-como-combater-radicalismos-como-estado-islamico.htm",
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-diversidade-sexual-um-debate-social.htm",
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-feminicidio-no-brasil-um-debate-importante-sobre-violencia-contra.htm",
     ]
 
     def parse(self, response):
@@ -153,7 +309,8 @@ class BrasilEscolaSpider(scrapy.Spider):
         }
     
         for essay_url in response.css('table#redacoes_corrigidas a::attr(href)').extract():
-            if '8117' not in essay_url and '13591' not in essay_url:
+            print(essay_url)
+            if '13512' not in essay_url:# and '13591' not in essay_url:
                 continue
             
             print('Reading essay from URL {0}'.format(essay_url))
