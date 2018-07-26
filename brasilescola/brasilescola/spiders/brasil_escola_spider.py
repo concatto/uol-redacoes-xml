@@ -23,14 +23,15 @@ ESSAY_COMMENTS_SUB2 = re.compile(r'Competências avaliadas.+', re.DOTALL)
 ESSAY_TEXT_SUB = re.compile(r' \[[^\]]+\] ')
 ESSAY_TEXT_SUB2 = re.compile(r'\[[^\]]+\]')
 ESSAY_TEXT_SUB3 = re.compile(r' \[[^\]]*\]')
-RED_SPAN = 'span[style*="#FF0000"], span[style*="rgb(255"]'
+RED_SPAN = 'span[style*="#FF0000"]'
 ORANGE_SPAN = 'span[style*="#e74c3c"]'
 STRUCK_TEXT = 'strike, s'
 CORRECTED_FULL_STOP = ' (.)'
 CORRECTED_COMMA = ' (,)'
 CORRECTED_SEMICOLON = ' (;)'
 
-
+def select_red_spans(dom):
+    return dom.select('span[style*="#FF0000"]') + dom.select('span[style*="rgb(255"]')
 
 # Handles both tags and navigable strings.
 def as_text(element):
@@ -40,16 +41,16 @@ def as_text(element):
     return element.string
 
 def split_in_paragraphs(dom):
-    print(dom.get_text())
+    print("### Going to split!")
     paragraphs = [""]
     for p in dom.select("p"):
-        for child in p.children:
+        for child in p.descendants:
             text = as_text(child)
 
-            if child.name != 'br' and text != None:
+            if child.name == None and text != None:
                 paragraphs[-1] += text
-                    
-            elif len(paragraphs[-1].strip()) > 0:
+
+            elif child.name == 'br' and len(paragraphs[-1].strip()) > 0:
                 paragraphs.append("")
 
         if len(paragraphs[-1].strip()) > 0:
@@ -131,7 +132,11 @@ def is_first_letter(element):
     return False
 
 def remove_wrapped_in_parenthesis(dom):
-    for el in dom.select(RED_SPAN):
+    print("WRAPPED IN PARENTHESIS")
+    for el in select_red_spans(dom):
+        print(el)
+
+    for el in select_red_spans(dom):
         print("Testing", el, type(el))
 
         prev_el = el.previous_sibling
@@ -144,29 +149,32 @@ def remove_wrapped_in_parenthesis(dom):
                 prev_replacement = as_text(prev_el)[0:-1]
                 next_replacement = as_text(next_el)[1:]
 
-                prev_el.replace_with(prev_replacement)
-                next_el.replace_with(next_replacement)
-                el.extract()
-                print("Should remove this one")
-                print('Swapping "%s" with "%s"' % (prev_el, prev_replacement))
-                print('Swapping "%s" with "%s"' % (next_el, next_replacement))
+                prev_el.string.replace_with(prev_replacement)
+                next_el.string.replace_with(next_replacement)
+                el.string.replace_with("")
 
-def correct_spacing(new_text, element):
+                print("After transformation:")
+
+def correct_spacing(final_text, element):
     prev_el = element.previous_sibling
     next_el = element.next_sibling
 
-    # print("Going to correct!")
-    # print("Prev \"%s\"" % prev_el)
-    # print("Next \"%s\"" % next_el)
+    print("Going to correct!")
+    print("Prev \"%s\"" % prev_el)
+    print("Next \"%s\"" % next_el)
 
-    if prev_el and as_text(prev_el)[-1].isalpha() and new_text[0].isalpha():
-        new_text = " " + new_text
+    if final_text:
+        if prev_el and as_text(prev_el)[-1].isalpha() and final_text[0].isalpha():
+            final_text = " " + final_text
 
-    if next_el and as_text(next_el)[0].isalpha() and new_text[-1].isalpha():
-        new_text += " "
+        if next_el and as_text(next_el)[0].isalpha() and final_text[-1].isalpha():
+            final_text += " "
+    else:
+        if prev_el and prev_el[-1].isalpha() and next_el and next_el[0].isalpha():
+            final_text = " "
 
-    #print("Result after correcting: \"%s\"" % new_text)
-    return new_text
+    #print("Result after correcting: \"%s\"" % final_text)
+    return final_text
 
 def handle_struck_text(el):
     c = children_with_content(el)
@@ -195,11 +203,11 @@ def remove_within_square_brackets(dom):
     for section in dom.select("strong"):
         #print("Original: \"%s\"" % section)
 
-        new_text = ESSAY_TEXT_SUB3.sub('', section.get_text())
-        new_text = ESSAY_TEXT_SUB2.sub('', new_text)
-        #print("New: \"%s\"" % new_text)
+        final_text = ESSAY_TEXT_SUB3.sub('', section.get_text())
+        final_text = ESSAY_TEXT_SUB2.sub('', final_text)
+        #print("New: \"%s\"" % final_text)
 
-        section.replace_with(new_text)
+        section.replace_with(final_text)
 
 def handle_coloured_section(el):
     text = el.get_text()
@@ -207,7 +215,7 @@ def handle_coloured_section(el):
     if text.isspace():
         return text
 
-    #print("Original text: \"%s\"" % text)
+    print("Original text: \"%s\"" % text)
     has_letter = True in (c.isalpha() for c in text)
 
     if has_letter and is_part_of_word(el) and el.select_one(STRUCK_TEXT) == None:
@@ -237,28 +245,26 @@ def handle_recent_content(dom):
         if len(struck_parents) > 0:
             continue # this one is struck, so it's part of the original text
         
-        new_text = handle_coloured_section(el)
-        #print("New text: \"%s\"" % new_text)
+        final_text = handle_coloured_section(el)
+        #print("New text: \"%s\"" % final_text)
 
         if el.select_one(STRUCK_TEXT) != None:
             for child in el.children:
                 if child.name == None:
                     child.extract() # remove every text node
         
-        if new_text != old_text:
-            el.replace_with(new_text)
+        if final_text != old_text:
+            el.replace_with(final_text)
 
 def handle_red_content(dom):
-    for el in dom.select(RED_SPAN):
-        #print("Looking @ element: ", el)
-        new_text = handle_coloured_section(el)
-
-        new_text = new_text.replace(CORRECTED_FULL_STOP, '')
-        new_text = new_text.replace(CORRECTED_COMMA, '')
-        new_text = new_text.replace(CORRECTED_SEMICOLON, '')
-        el.replace_with(new_text)
-
     remove_wrapped_in_parenthesis(dom)
+
+    for el in select_red_spans(dom):
+        #print("Looking @ element: ", el)
+        final_text = handle_coloured_section(el)
+        final_text = correct_spacing(final_text, el)
+
+        el.replace_with(final_text)
 
 def handle_content_alternative(html):
     dom = BeautifulSoup(html.replace("*", ""))
@@ -269,39 +275,9 @@ def handle_content_alternative(html):
     if dom.select_one(ORANGE_SPAN) != None:
         print("This is an orange essay.")
         handle_recent_content(dom) # It's a recent essay
-    elif dom.select_one(RED_SPAN) != None:
+    elif len(select_red_spans(dom)) > 0:
         print("This is a red essay.")
-        had_red = False
-        for el in dom.select(RED_SPAN):
-            print("Looking @ element: ", el)
-            text = el.get_text()
-            new_text = text
-            print("Original text: \"%s\"" % text)
-            has_letter = True in (c.isalpha() for c in text)
-
-            if has_letter and is_part_of_word(el) and el.select_one(STRUCK_TEXT) == None:
-                decoded = unidecode(text)
-
-                if decoded != text:
-                    new_text = decoded # if it had an accent, remove the accent
-                elif len(text) == 1 and text.isupper():
-                    new_text = text.lower() # if it got corrected to uppercase, undo it
-                else:
-                    new_text = "" # otherwise remove the text itself
-            else:
-                if el.select_one(STRUCK_TEXT) != None:
-                    new_text = handle_struck_text(el)
-
-            new_text = new_text.replace(CORRECTED_FULL_STOP, '')
-            new_text = new_text.replace(CORRECTED_COMMA, '')
-            new_text = new_text.replace(CORRECTED_SEMICOLON, '')
-            el.replace_with(new_text)
-
-            had_red = True
-
-
-        if had_red:
-            remove_wrapped_in_parenthesis(dom)
+        handle_red_content(dom)            
     else: # One of the old ones
         print("This is an old essay.")
         remove_within_square_brackets(dom)
@@ -311,6 +287,7 @@ def handle_content_alternative(html):
     print("== * ==")
     
     
+    print("Paragraphs before replacements:")
     paragraphs = split_in_paragraphs(dom)
     for i, paragraph in enumerate(paragraphs):
         print("%d. %s" % (i + 1, paragraph))
@@ -318,8 +295,17 @@ def handle_content_alternative(html):
 
     print("============================================================")
 
+
+    final_text = "\n".join(paragraphs)
+    final_text = final_text.replace(CORRECTED_FULL_STOP, '')
+    final_text = final_text.replace(CORRECTED_COMMA, '')
+    final_text = final_text.replace(CORRECTED_SEMICOLON, '')
+
+    return final_text
+
 def handle_essay_content(html):
-    handle_content_alternative(html)
+    text = handle_content_alternative(html)
+    return text, []
 
     # TODO Fix error 'ID redacoes_corrigidas already defined' in lxml.etree.XMLSyntaxError: line 111
     d = pq(html)
@@ -333,25 +319,25 @@ def handle_essay_content(html):
     #errors = d.find('s').map(lambda i, e: (pq(e).text())) 
     # Some of the evaluators corrections are inside a span, and the span contains the text with the fixed version
     for strike in d.find('p > span > s, p > span > strike'):
-        new_text = pq(strike).text()
+        final_text = pq(strike).text()
         print("Strike --> ", strike)
-        print("New text ==> ", new_text)
-        if new_text is None: continue
+        print("New text ==> ", final_text)
+        if final_text is None: continue
         # Sometimes the fixed text has spaces and the original version (selected part) has not,
         # causing words to get mixed
         review_text = pq(pq(strike).html()).remove('s, strik').text()
         print("Review text ~~> ", review_text)
-        if not new_text.startswith(' ') and review_text.startswith(' '):
-            new_text = ' ' + new_text
-        if not new_text.endswith(' ') and review_text.endswith(' '):
-            new_text = new_text + ' '
+        if not final_text.startswith(' ') and review_text.startswith(' '):
+            final_text = ' ' + final_text
+        if not final_text.endswith(' ') and review_text.endswith(' '):
+            final_text = final_text + ' '
         parent = pq(strike).parent('span')       
         if parent is None: continue
         # TODO doesn't work when a span contains more than one strike
         try:
-            parent.replaceWith(new_text)
+            parent.replaceWith(final_text)
         except:
-            print("Could\'t replace text with {0}".format(new_text))
+            print("Could\'t replace text with {0}".format(final_text))
             
     # Remove evaluators comments from the text using span to red color it
     # TODO The span is replaced by a unwanted space when it is not between spaces, eg "est<span>r</span>eitam"
@@ -379,10 +365,10 @@ class BrasilEscolaSpider(scrapy.Spider):
     allowed_domains = ['vestibular.brasilescola.uol.com.br']
     start_urls = [
         #'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-corrupcao.htm',
-        #'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-caminhos-para-superar-os-desafios-encontrados-pelos-negros-atualmente.htm',
-        #"https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-Agua-desafio-uso-racional-preservacao.htm",
-        #"https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-estamos-nos-relacionando-forma-superficial.htm",
-        #"https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-porte-armas-pela-populacao-civil.htm",
+        'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-caminhos-para-superar-os-desafios-encontrados-pelos-negros-atualmente.htm',
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-Agua-desafio-uso-racional-preservacao.htm",
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-estamos-nos-relacionando-forma-superficial.htm",
+        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-porte-armas-pela-populacao-civil.htm",
         "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-desinformacao-historica-um-problema-mil-consequencias.htm",
         "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-os-caminhos-viaveis-para-uma-saude-publica-qualidade.htm",
         "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-favelizacao.htm",
@@ -410,7 +396,7 @@ class BrasilEscolaSpider(scrapy.Spider):
     
         for essay_url in response.css('table#redacoes_corrigidas a::attr(href)').extract():
             print(essay_url)
-            if '8664' not in essay_url:# and '13591' not in essay_url:
+            if '11942' not in essay_url:# and '13591' not in essay_url:
                 continue
             
             print('Reading essay from URL {0}'.format(essay_url))
