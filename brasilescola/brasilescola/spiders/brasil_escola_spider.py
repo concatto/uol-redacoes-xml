@@ -14,6 +14,8 @@ h.ignore_images = True
 h.ignore_emphasis = True
 h.body_width = False
 
+paragraph_summary = {}
+
 IGNORE_CHAR = re.compile(r'(^[\r\n\t\s]+|[\r\n\t\s]+$)')
 EXTRACT_NUMBER = re.compile(r'[^\d](\d+([.,]\d+)?).*')
 PROMPT_DESCRIPTION_SUB = re.compile(r'Saiba como fazer uma boa.+', re.DOTALL)
@@ -26,6 +28,11 @@ ESSAY_TEXT_SUB3 = re.compile(r' \[[^\]]*\]')
 RED_SPAN = 'span[style*="#FF0000"]'
 ORANGE_SPAN = 'span[style*="#e74c3c"]'
 STRUCK_TEXT = 'strike, s'
+PARENTHESIZED_CORRECTION = re.compile(r'\s*\(.+\)\s*')
+PARENTHESIZED_PUNCTUATION = re.compile(r'\([.,;:]\)')
+PUNCTUATION = re.compile(r'[.,;:]')
+EMPTY_PARENTHESIS = '()'
+CORRECTED_PUNCTUATION = re.compile(r'([.,;:])\s*\([.,;:]?\)')
 CORRECTED_FULL_STOP = ' (.)'
 CORRECTED_COMMA = ' (,)'
 CORRECTED_SEMICOLON = ' (;)'
@@ -35,10 +42,17 @@ def select_red_spans(dom):
 
 # Handles both tags and navigable strings.
 def as_text(element):
-    if element is None:
+    if element is None or element.string is None:
         return ""
 
     return element.string
+
+def find_old_evidence(dom):
+    for suspect in dom.select('u strong'):
+        if ESSAY_TEXT_SUB2.search(as_text(suspect)):
+            return True
+    
+    return False
 
 def split_in_paragraphs(dom):
     print("### Going to split!")
@@ -104,7 +118,7 @@ def handle_prompt_content(html):
 
     return description, info, date
 
-def is_part_of_word(element):
+def is_part_of_word(element, not_in_boundaries=False):
     print("Testing if part of word ", element)
     text = element.get_text()
     if " " in text:
@@ -114,8 +128,18 @@ def is_part_of_word(element):
     next_el = as_text(element.next_sibling)
     print("Prev \"%s\"" % prev_el)
     print("Next \"%s\"" % next_el)
-    if ((prev_el and prev_el[-1].isalpha() and text[0].isalpha()) or
-        (next_el and next_el[0].isalpha() and text[-1].isalpha())):
+
+    part_of_prev = prev_el and prev_el[-1].isalpha() and text[0].isalpha()
+    part_of_next = next_el and next_el[0].isalpha() and text[-1].isalpha()
+
+    is_part = False
+    if not_in_boundaries:
+        is_part = part_of_prev and part_of_next
+    else:
+        is_part = part_of_prev or part_of_next
+        
+        
+    if is_part:
         print("Yes")
         return True
     
@@ -145,9 +169,12 @@ def remove_wrapped_in_parenthesis(dom):
         print("Next \"%s\"" % next_el, type(next_el))
 
         if prev_el != None and next_el != None:
-            if prev_el.endswith("(") and next_el.startswith(")"):
-                prev_replacement = as_text(prev_el)[0:-1]
-                next_replacement = as_text(next_el)[1:]
+            prev_text = as_text(prev_el)
+            next_text = as_text(next_el)
+
+            if prev_text.endswith("(") and next_text.startswith(")"):
+                prev_replacement = prev_text[0:-1]
+                next_replacement = next_text[1:]
 
                 prev_el.string.replace_with(prev_replacement)
                 next_el.string.replace_with(next_replacement)
@@ -155,22 +182,34 @@ def remove_wrapped_in_parenthesis(dom):
 
                 print("After transformation:")
 
-def correct_spacing(final_text, element):
+def correct_spacing(final_text, element, original_text = None):
+    print("Going to correct!")
+
+    if original_text == None:
+        original_text = final_text
+    else:
+        print("Was \"%s\"" % original_text)
+        print("Is now \"%s\"" % final_text)
+
+
     prev_el = element.previous_sibling
     next_el = element.next_sibling
 
-    print("Going to correct!")
-    print("Prev \"%s\"" % prev_el)
-    print("Next \"%s\"" % next_el)
+    print("Prev \"%s\"" % as_text(prev_el))
+    print("Next \"%s\"" % as_text(next_el))
+
+    prev_text = as_text(prev_el)
+    next_text = as_text(next_el)
 
     if final_text:
-        if prev_el and as_text(prev_el)[-1].isalpha() and final_text[0].isalpha():
-            final_text = " " + final_text
+        #if len(final_text) > 1:
+            if prev_text and prev_text[-1].isalpha() and final_text[0].isalpha() and not original_text[0].isalpha():
+                final_text = " " + final_text
 
-        if next_el and as_text(next_el)[0].isalpha() and final_text[-1].isalpha():
-            final_text += " "
+            if next_text and next_text[0].isalpha() and final_text[-1].isalpha() and not original_text[-1].isalpha():
+                final_text += " "
     else:
-        if prev_el and prev_el[-1].isalpha() and next_el and next_el[0].isalpha():
+        if prev_text and prev_text[-1].isalpha() and next_text and next_text[0].isalpha():
             final_text = " "
 
     #print("Result after correcting: \"%s\"" % final_text)
@@ -211,14 +250,41 @@ def remove_within_square_brackets(dom):
 
 def handle_coloured_section(el):
     text = el.get_text()
+    #print("Original text: \"%s\"" % text)
 
     if text.isspace():
         return text
 
-    print("Original text: \"%s\"" % text)
+    # Handles constructions of the form:
+    # <red>PUNCT</red> (<red>PUNCT</red> ...
+    # Where it should be left as it is in this stage
+    # and replaced with a regex after processing
+    if PUNCTUATION.match(text):
+        #print("!!! MATCHED:", text)
+        next_el = el.next_sibling
+        next_text = as_text(next_el)
+        if next_text.startswith(' (') or next_text.startswith('('):
+            if PUNCTUATION.match(as_text(next_el.next_sibling)):
+                return text
+
+    # Handles situations such as <red>(Vírgula) j</red>á que
+    has_struck_child = el.select_one(STRUCK_TEXT) != None
+    if not has_struck_child:
+        #print("--> Before: \"%s\"" % text)
+        new_text = PARENTHESIZED_CORRECTION.sub('', text)
+        if new_text != text:
+            #print("--> Changed to: \"%s\"" % new_text)
+            text = new_text
+            el.string = new_text
+        #print("--> After: \"%s\"" % text)
+
+
     has_letter = True in (c.isalpha() for c in text)
 
-    if has_letter and is_part_of_word(el) and el.select_one(STRUCK_TEXT) == None:
+    if has_letter and is_part_of_word(el) and not has_struck_child:
+        if text == 'ç':
+            return 'c'
+
         decoded = unidecode(text)
 
         if decoded != text:
@@ -230,7 +296,7 @@ def handle_coloured_section(el):
         else:
             return ""
     else:
-        if el.select_one(STRUCK_TEXT) != None:
+        if has_struck_child:
             return handle_struck_text(el)
     
     return ""
@@ -257,49 +323,60 @@ def handle_recent_content(dom):
             el.replace_with(final_text)
 
 def handle_red_content(dom):
-    remove_wrapped_in_parenthesis(dom)
-
     for el in select_red_spans(dom):
         #print("Looking @ element: ", el)
+        original = el.get_text()
         final_text = handle_coloured_section(el)
-        final_text = correct_spacing(final_text, el)
+        final_text = correct_spacing(final_text, el, original)
 
         el.replace_with(final_text)
 
+    remove_wrapped_in_parenthesis(dom)
+
 def handle_content_alternative(html):
     dom = BeautifulSoup(html.replace("*", ""))
-    print(dom)
-    print("== # ==")
-    print(dom.prettify())
+    # print(dom)
+    # print("== # ==")
+    # print(dom.prettify())
 
     if dom.select_one(ORANGE_SPAN) != None:
         print("This is an orange essay.")
         handle_recent_content(dom) # It's a recent essay
-    elif len(select_red_spans(dom)) > 0:
+    elif len(select_red_spans(dom)) > 0 and not find_old_evidence(dom):
         print("This is a red essay.")
         handle_red_content(dom)            
     else: # One of the old ones
         print("This is an old essay.")
         remove_within_square_brackets(dom)
     
-    print("========== $$$ ==========")
-    print(dom.prettify())
-    print("== * ==")
+    # print("========== $$$ ==========")
+    # print(dom.prettify())
+    # print("== * ==")
     
     
     print("Paragraphs before replacements:")
     paragraphs = split_in_paragraphs(dom)
-    for i, paragraph in enumerate(paragraphs):
-        print("%d. %s" % (i + 1, paragraph))
+    # for i, paragraph in enumerate(paragraphs):
+    #     print("%d. %s" % (i + 1, paragraph))
 
+    count = len(paragraphs)
+    if count in paragraph_summary.keys():
+        paragraph_summary[count] += 1
+    else:
+        paragraph_summary[count] = 1
 
+    for k, v in paragraph_summary.items():
+        print(k, " paragraphs: ", v)
     print("============================================================")
 
 
     final_text = "\n".join(paragraphs)
+    final_text = CORRECTED_PUNCTUATION.sub(r'\1', final_text)
     final_text = final_text.replace(CORRECTED_FULL_STOP, '')
     final_text = final_text.replace(CORRECTED_COMMA, '')
     final_text = final_text.replace(CORRECTED_SEMICOLON, '')
+    final_text = final_text.replace(EMPTY_PARENTHESIS, '')
+    final_text = PARENTHESIZED_PUNCTUATION.sub('', final_text)
 
     return final_text
 
@@ -364,21 +441,22 @@ class BrasilEscolaSpider(scrapy.Spider):
     name =  'brasilescolaspider'
     allowed_domains = ['vestibular.brasilescola.uol.com.br']
     start_urls = [
-        #'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-corrupcao.htm',
-        'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-caminhos-para-superar-os-desafios-encontrados-pelos-negros-atualmente.htm',
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-Agua-desafio-uso-racional-preservacao.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-estamos-nos-relacionando-forma-superficial.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-porte-armas-pela-populacao-civil.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-desinformacao-historica-um-problema-mil-consequencias.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-os-caminhos-viaveis-para-uma-saude-publica-qualidade.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-favelizacao.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-como-combater-radicalismos-como-estado-islamico.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-diversidade-sexual-um-debate-social.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-feminicidio-no-brasil-um-debate-importante-sobre-violencia-contra.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-equidade-genero-no-brasil-um-desafio.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-mudanca-valores-conceito-familia-no-seculo-xxi.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-os-refugiados-tentativa-buscar-sobrevivencia-outros-paises-imigracao.htm",
-        "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-reforma-politica-que-deve-ser-mudado.htm",
+        'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-corrupcao.htm',
+        # 'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-caminhos-para-superar-os-desafios-encontrados-pelos-negros-atualmente.htm',
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-Agua-desafio-uso-racional-preservacao.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-estamos-nos-relacionando-forma-superficial.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-porte-armas-pela-populacao-civil.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-desinformacao-historica-um-problema-mil-consequencias.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-os-caminhos-viaveis-para-uma-saude-publica-qualidade.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-favelizacao.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-como-combater-radicalismos-como-estado-islamico.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-diversidade-sexual-um-debate-social.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-feminicidio-no-brasil-um-debate-importante-sobre-violencia-contra.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-equidade-genero-no-brasil-um-desafio.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-mudanca-valores-conceito-familia-no-seculo-xxi.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-os-refugiados-tentativa-buscar-sobrevivencia-outros-paises-imigracao.htm",
+        # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-reforma-politica-que-deve-ser-mudado.htm",
+        # 'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-informacao-sociedade-combate-as-fake-news-ano-eleicoes-presidenciais.htm',
     ]
 
     def parse(self, response):
@@ -395,17 +473,17 @@ class BrasilEscolaSpider(scrapy.Spider):
         }
     
         for essay_url in response.css('table#redacoes_corrigidas a::attr(href)').extract():
-            print(essay_url)
-            if '11942' not in essay_url:# and '13591' not in essay_url:
-                continue
+            if '5448' not in essay_url:# and '13591' not in essay_url:
+               continue
             
+            print(essay_url)
             print('Reading essay from URL {0}'.format(essay_url))
             yield response.follow(essay_url, self.parse_essay, meta={'prompt': prompt_url})
             # break
 
-        #next_page = response.css('div.paginador a::attr(href)').extract()[0]
-        #if next_page != '': # and 'caminhos' in next_page:
-        #    yield response.follow(next_page, self.parse)
+        next_page = response.css('div.paginador a::attr(href)').extract()[0]
+        if next_page != '': # and 'caminhos' in next_page:
+           yield response.follow(next_page, self.parse)
 
     def parse_essay(self, response):
         try:
@@ -427,6 +505,8 @@ class BrasilEscolaSpider(scrapy.Spider):
             review = remove_double_breaks(get_div_text(html_text))
             original_text, errors = handle_essay_content(html_text)
 
+            print("URL -->")
+            print(response.url)
             print("THIS WOULD GO INTO THE JSON FILE AS \"text\"")
             print(original_text)
             print("END OF TEXT")
@@ -448,5 +528,6 @@ class BrasilEscolaSpider(scrapy.Spider):
             }
         except Exception as e:
             traceback.print_exc()
+            input("Press something to continue.")
 
 
