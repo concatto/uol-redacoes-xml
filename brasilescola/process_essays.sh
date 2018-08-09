@@ -1,5 +1,5 @@
 echo "Fixing"
-python fix.py > essays_fixed.json
+python fix.py
 echo "Prettifying"
 cat essays_fixed.json | python -m json.tool > essays_pretty.json
 echo "Encoding"

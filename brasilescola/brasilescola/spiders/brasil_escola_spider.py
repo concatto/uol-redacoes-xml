@@ -4,6 +4,7 @@ import scrapy
 import html2text
 import re
 import traceback
+import json
 from unidecode import unidecode
 from pyquery import PyQuery as pq
 from bs4 import BeautifulSoup
@@ -22,9 +23,9 @@ PROMPT_DESCRIPTION_SUB = re.compile(r'Saiba como fazer uma boa.+', re.DOTALL)
 PROMPT_INFO_SUB = re.compile(r'.+Elabore sua redação[^\r\n]+[\r\n]*', re.DOTALL)
 ESSAY_COMMENTS_SUB = re.compile(r'.+Comentários do corretor', re.DOTALL)
 ESSAY_COMMENTS_SUB2 = re.compile(r'Competências avaliadas.+', re.DOTALL)
-ESSAY_TEXT_SUB = re.compile(r' \[[^\]]+\] ')
-ESSAY_TEXT_SUB2 = re.compile(r'\[[^\]]+\]')
-ESSAY_TEXT_SUB3 = re.compile(r' \[[^\]]*\]')
+ESSAY_TEXT_SUB = re.compile(r' \[[^\]~]+[\]~] ')
+ESSAY_TEXT_SUB2 = re.compile(r'\[[^\]~]+[\]~]')
+ESSAY_TEXT_SUB3 = re.compile(r' \[[^\]~]*[\]~]')
 RED_SPAN = 'span[style*="#FF0000"]'
 ORANGE_SPAN = 'span[style*="#e74c3c"]'
 STRUCK_TEXT = 'strike, s'
@@ -121,8 +122,8 @@ def handle_prompt_content(html):
 def is_part_of_word(element, not_in_boundaries=False):
     print("Testing if part of word ", element)
     text = element.get_text()
-    if " " in text:
-        return False # is not a single component
+    if not text or " " in text:
+        return False # empty element or is not a single component
 
     prev_el = as_text(element.previous_sibling)
     next_el = as_text(element.next_sibling)
@@ -208,7 +209,7 @@ def correct_spacing(final_text, element, original_text = None):
 
             if next_text and next_text[0].isalpha() and final_text[-1].isalpha() and not original_text[-1].isalpha():
                 final_text += " "
-    else:
+    elif not is_part_of_word(element, True):
         if prev_text and prev_text[-1].isalpha() and next_text and next_text[0].isalpha():
             final_text = " "
 
@@ -237,23 +238,56 @@ def handle_struck_text(el):
         
         return correct_spacing(el.get_text(), el)
 
+def is_surrounded_by(element, left, right):
+    print("Checking if %s is surrounded by %s and %s" % (as_text(element), left, right))
+
+    prev_el = element.previous_sibling
+    next_el = element.next_sibling
+
+    prev_text = as_text(prev_el)
+    next_text = as_text(next_el)
+
+    print("Left: \"" + prev_text + "\"")
+    print("Right: \"" + next_text + "\"")
+
+
+    result = (prev_text and prev_text.endswith(left) and
+            next_text and next_text.startswith(right))
+
+    print(result)
+
+    return result
 
 def remove_within_square_brackets(dom):
     for section in dom.select("strong"):
+        final_text = section.get_text()
+
+        if is_surrounded_by(section, '[', ']'):
+            section.previous_sibling.string = section.previous_sibling.string[:-1]
+            section.next_sibling.string = section.next_sibling.string[1:]
+            final_text = ''
+
         #print("Original: \"%s\"" % section)
 
-        final_text = ESSAY_TEXT_SUB3.sub('', section.get_text())
+        final_text = ESSAY_TEXT_SUB3.sub('', final_text)
         final_text = ESSAY_TEXT_SUB2.sub('', final_text)
         #print("New: \"%s\"" % final_text)
 
-        section.replace_with(final_text)
+        section.string = final_text
 
 def handle_coloured_section(el):
     text = el.get_text()
+
     #print("Original text: \"%s\"" % text)
 
     if text.isspace():
         return text
+
+    underscored = el.find_all("u", recursive=False, limit=1)
+    if len(underscored) == 1:
+        underscored_text = as_text(underscored[0])
+        if len(underscored_text) > 1:
+            return text
 
     # Handles constructions of the form:
     # <red>PUNCT</red> (<red>PUNCT</red> ...
@@ -324,20 +358,53 @@ def handle_recent_content(dom):
 
 def handle_red_content(dom):
     for el in select_red_spans(dom):
+        struck_parents = list(el.find_parents("strike")) + list(el.find_parents("s"))
+
+        if len(struck_parents) > 0:
+            continue
+
         #print("Looking @ element: ", el)
         original = el.get_text()
         final_text = handle_coloured_section(el)
         final_text = correct_spacing(final_text, el, original)
 
-        el.replace_with(final_text)
+        el.string = final_text
 
     remove_wrapped_in_parenthesis(dom)
 
-def handle_content_alternative(html):
+def clean_content(dom):
+    for style in dom.select("body style"):
+        style.decompose()
+
+    q = None
+    # if dom.select_one("div.OutlineElement") != None:
+    q = dom.select("body > *")
+
+    elements = []
+    after_initial_ad = False
+
+    for el in q:
+        if el.name in ["p", "div", "span"]:
+            print(el.attrs)
+            if "class" in el.attrs and "publicidade-content" in el.attrs["class"]:
+                after_initial_ad = not after_initial_ad
+            elif after_initial_ad:
+                elements.append(el)
+
+    print("Kept")
+    print(elements)
+
+    # else:
+    #     q = dom.select("body > p")
+    return BeautifulSoup(''.join(map(str, elements)))
+
+def handle_content_alternative(html, url):
     dom = BeautifulSoup(html.replace("*", ""))
-    # print(dom)
-    # print("== # ==")
-    # print(dom.prettify())
+    dom = clean_content(dom)
+
+    # print("========== $$$ ==========")
+    # print(dom.get_text())
+    # print("== * ==")
 
     if dom.select_one(ORANGE_SPAN) != None:
         print("This is an orange essay.")
@@ -350,8 +417,9 @@ def handle_content_alternative(html):
         remove_within_square_brackets(dom)
     
     # print("========== $$$ ==========")
-    # print(dom.prettify())
+    # print(dom.get_text())
     # print("== * ==")
+    
     
     
     print("Paragraphs before replacements:")
@@ -361,12 +429,12 @@ def handle_content_alternative(html):
 
     count = len(paragraphs)
     if count in paragraph_summary.keys():
-        paragraph_summary[count] += 1
+        paragraph_summary[count].append(url)
     else:
-        paragraph_summary[count] = 1
+        paragraph_summary[count] = [url]
 
     for k, v in paragraph_summary.items():
-        print(k, " paragraphs: ", v)
+        print(k, " paragraphs: ", len(v))
     print("============================================================")
 
 
@@ -377,55 +445,10 @@ def handle_content_alternative(html):
     final_text = final_text.replace(CORRECTED_SEMICOLON, '')
     final_text = final_text.replace(EMPTY_PARENTHESIS, '')
     final_text = PARENTHESIZED_PUNCTUATION.sub('', final_text)
+    final_text = ESSAY_TEXT_SUB3.sub('', final_text)
+    final_text = ESSAY_TEXT_SUB2.sub('', final_text)
 
-    return final_text
-
-def handle_essay_content(html):
-    text = handle_content_alternative(html)
-    return text, []
-
-    # TODO Fix error 'ID redacoes_corrigidas already defined' in lxml.etree.XMLSyntaxError: line 111
-    d = pq(html)
-    if d.text() == '':
-        return '', []
-    print(d.text())
-    
-    errors = []
-
-    # This catches only few errors in the most recent version of the page layout
-    #errors = d.find('s').map(lambda i, e: (pq(e).text())) 
-    # Some of the evaluators corrections are inside a span, and the span contains the text with the fixed version
-    for strike in d.find('p > span > s, p > span > strike'):
-        final_text = pq(strike).text()
-        print("Strike --> ", strike)
-        print("New text ==> ", final_text)
-        if final_text is None: continue
-        # Sometimes the fixed text has spaces and the original version (selected part) has not,
-        # causing words to get mixed
-        review_text = pq(pq(strike).html()).remove('s, strik').text()
-        print("Review text ~~> ", review_text)
-        if not final_text.startswith(' ') and review_text.startswith(' '):
-            final_text = ' ' + final_text
-        if not final_text.endswith(' ') and review_text.endswith(' '):
-            final_text = final_text + ' '
-        parent = pq(strike).parent('span')       
-        if parent is None: continue
-        # TODO doesn't work when a span contains more than one strike
-        try:
-            parent.replaceWith(final_text)
-        except:
-            print("Could\'t replace text with {0}".format(final_text))
-            
-    # Remove evaluators comments from the text using span to red color it
-    # TODO The span is replaced by a unwanted space when it is not between spaces, eg "est<span>r</span>eitam"
-    original = h.handle(d.remove('p > span').html())
-    original = strip(original.replace('~~', ''))
-    original = remove_double_breaks(original)
-    # Remove comments with the template "original word [fixed word]"
-    original = ESSAY_TEXT_SUB.sub(' ', original)
-    original = ESSAY_TEXT_SUB2.sub('', original)
-    
-    return original, errors
+    return final_text, []
 
 def handle_essay_comments(html):
     d = pq(html)
@@ -441,7 +464,8 @@ class BrasilEscolaSpider(scrapy.Spider):
     name =  'brasilescolaspider'
     allowed_domains = ['vestibular.brasilescola.uol.com.br']
     start_urls = [
-        'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-corrupcao.htm',
+        'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/',
+        #"https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-a-retomada-espaco-publico-nas-cidades.htm",
         # 'https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-caminhos-para-superar-os-desafios-encontrados-pelos-negros-atualmente.htm',
         # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-Agua-desafio-uso-racional-preservacao.htm",
         # "https://vestibular.brasilescola.uol.com.br/banco-de-redacoes/tema-estamos-nos-relacionando-forma-superficial.htm",
@@ -473,8 +497,8 @@ class BrasilEscolaSpider(scrapy.Spider):
         }
     
         for essay_url in response.css('table#redacoes_corrigidas a::attr(href)').extract():
-            if '5448' not in essay_url:# and '13591' not in essay_url:
-               continue
+            # if '8412' not in essay_url:# and '13591' not in essay_url:
+            #    continue
             
             print(essay_url)
             print('Reading essay from URL {0}'.format(essay_url))
@@ -485,8 +509,14 @@ class BrasilEscolaSpider(scrapy.Spider):
         if next_page != '': # and 'caminhos' in next_page:
            yield response.follow(next_page, self.parse)
 
+    def closed(self, reason):
+        with open("paragraphs.json", "w") as paragraphs_file:
+            paragraphs_file.write(json.dumps(paragraph_summary))
+
     def parse_essay(self, response):
         try:
+            print("URL -->")
+            print(response.url)
             title = strip(get_text(response, '.conteudo-pagina h1').replace('Banco de Redações', ''))
             scores = {}
 
@@ -501,9 +531,9 @@ class BrasilEscolaSpider(scrapy.Spider):
             total_score = extract_number(score_text)
             if total_score == -1: total_score = response.css('.conteudo-pagina table tr td:nth-child(2)::text').extract()[6]
 
-            html_text = ''.join(response.css('.conteudo-pagina .conteudo-materia > p').extract())
+            html_text = ''.join(response.css('.conteudo-pagina .conteudo-materia > *').extract())
             review = remove_double_breaks(get_div_text(html_text))
-            original_text, errors = handle_essay_content(html_text)
+            original_text, errors = handle_content_alternative(html_text, response.url)
 
             print("URL -->")
             print(response.url)
